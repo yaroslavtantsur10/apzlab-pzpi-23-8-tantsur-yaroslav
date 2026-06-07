@@ -1,0 +1,212 @@
+МІНІСТЕРСТВО ОСВІТИ І НАУКИ УКРАЇНИ 
+ 
+ 
+ХАРКІВСЬКИЙ НАЦІОНАЛЬНИЙ 
+УНІВЕРСИТЕТ РАДІОЕЛЕКТРОНІКИ 
+ 
+Кафедра «Програмна інженерія» 
+ 
+ 
+ 
+ 
+ЗВІТ
+з лабораторної роботи №4 
+з дисципліни «Архітектура програмного забезпечення» 
+на тему «Масштабування бекенда» 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Виконав:                                                                                    Прийняв: 
+ст. гр. ПЗПІ-23-8                                                                       асистент. каф. ПІ Танцур Я.С.                                                                                Дашенков Д. С. 
+ 
+ 
+ 
+ 
+ 
+ 
+Харків 2026 
+ 
+4.1 Мета роботи
+Опанування практичних навичок проектування та реалізації масштабованих архітектур бекенд-систем для забезпечення їх стабільного функціонування в умовах високого навантаження. Робота спрямована на вивчення стратегій горизонтального масштабування шляхом розгортання системи у локальному середовищі з використанням контейнеризації Docker, балансувальника навантаження Nginx та проведення навантажувального тестування для кількісного аналізу продуктивності системи.
+4.2 Опис стратегії масштабування системи
+Для забезпечення високої доступності та відмовостійкості застосунку в умовах змінного трафіку було обрано стратегію горизонтального масштабування на базі локальної контейнерної платформи Docker з балансувальником навантаження Nginx.
+Основна ідея обраної стратегії полягає у розгортанні декількох ідентичних інстансів бекенд-сервера ComfortSpace (ASP.NET Core) в окремих Docker-контейнерах та розподілі вхідного трафіку між ними за допомогою Nginx. Кількість активних вузлів збільшувалась з 1 до 3 для порівняння продуктивності.
+Такий підхід базується на наступних принципах:
+- Гарантована потужність: фіксована кількість із трьох інстансів забезпечує миттєву готовність системи до пікових навантажень без затримок на запуск нових контейнерів.
+- Рівномірне балансування: Nginx розподіляє вхідні HTTP-запити між усіма активними вузлами (api1, api2, api3) методом round-robin, що дозволяє уникнути перевантаження окремого сервера.
+- Підвищена відмовостійкість: наявність трьох паралельних копій застосунку підвищує надійність системи; у разі виходу з ладу одного інстансу балансувальник переспрямовує трафік на інші робочі вузли.
+- Єдина база даних: всі три інстанси бекенду підключаються до одного контейнера Microsoft SQL Server 2022, що розгорнутий також у Docker.
+4.3 Аналіз вузьких місць
+Під час аналізу продуктивності було встановлено, що основним вузьким місцем системи при горизонтальному масштабуванні є ліміт одночасних з'єднань із базою даних. Оскільки кожен інстанс бекенда ініціалізує власний пул з'єднань, загальне навантаження на базу даних зростає мультиплікативно зі збільшенням кількості інстансів.
+Іншим критичним ресурсом є оперативна пам'ять окремих інстансів. В умовах високої інтенсивності запитів обсяг споживаної пам'яті може зростати швидше за завантаження CPU. Також слід враховувати затримки мережевого вводу-виводу та потенційне обмеження пропускної здатності самого балансувальника навантаження Nginx.
+4.4 Налаштування Docker
+Для розгортання системи було створено наступні конфігураційні файли: Dockerfile, docker-compose.yml та nginx.conf.
+FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS base
+WORKDIR /app
+EXPOSE 80
+
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+WORKDIR /src
+COPY ["ComfortSpace.csproj", "."]
+RUN dotnet restore "ComfortSpace.csproj"
+COPY . .
+RUN dotnet build "ComfortSpace.csproj" -c Release -o /app/build
+
+FROM build AS publish
+RUN dotnet publish "ComfortSpace.csproj" -c Release -o /app/publish
+
+FROM base AS final
+WORKDIR /app
+COPY --from=publish /app/publish .
+ENTRYPOINT ["dotnet", "ComfortSpace.dll"]
+
+
+ Конфігурація docker-compose.yml
+version: '3.8'
+
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      SA_PASSWORD: "ComfortSpace123!"
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: "Developer"
+    ports:
+      - "1433:1433"
+    volumes:
+      - sqldata:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P ComfortSpace123! -Q 'SELECT 1' -No || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api1:
+    build: .
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_URLS=http://+:80
+      - ConnectionStrings__DefaultConnection=Server=sqlserver;Database=ComfortSpace;User Id=sa;Password=ComfortSpace123!;TrustServerCertificate=True;
+      - Jwt__Key=SUPER_SECRET_KEY_CHANGE_ME_32+_CHARS
+      - Jwt__Issuer=ComfortSpace
+      - Jwt__Audience=ComfortSpaceClient
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+
+  api2:
+    build: .
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_URLS=http://+:80
+      - ConnectionStrings__DefaultConnection=Server=sqlserver;Database=ComfortSpace;User Id=sa;Password=ComfortSpace123!;TrustServerCertificate=True;
+      - Jwt__Key=SUPER_SECRET_KEY_CHANGE_ME_32+_CHARS
+      - Jwt__Issuer=ComfortSpace
+      - Jwt__Audience=ComfortSpaceClient
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+
+  api3:
+    build: .
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_URLS=http://+:80
+      - ConnectionStrings__DefaultConnection=Server=sqlserver;Database=ComfortSpace;User Id=sa;Password=ComfortSpace123!;TrustServerCertificate=True;
+      - Jwt__Key=SUPER_SECRET_KEY_CHANGE_ME_32+_CHARS
+      - Jwt__Issuer=ComfortSpace
+      - Jwt__Audience=ComfortSpaceClient
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "5000:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api1
+      - api2
+      - api3
+
+volumes:
+  sqldata:
+
+Конфігурація Nginx як load balancer
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream comfortspace_backend {
+        server api1:80;
+        server api2:80;
+        server api3:80;
+    }
+
+    server {
+        listen 80;
+
+        location / {
+            proxy_pass http://comfortspace_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+    }
+}
+
+Після запуску команди docker-compose up -d всі 5 контейнерів успішно запустились: sqlserver отримав статус Healthy, три інстанси API (api1, api2, api3) та nginx перейшли в статус Up. Система стала доступна на порту 5000.
+4.5 Навантажувальні тести
+Навантажувальне тестування проводилось за допомогою інструменту Locust. Сценарій тестування передбачав симуляцію 100 одночасних користувачів із темпом приросту 5 користувачів за секунду. Кожен віртуальний користувач почергово виконував GET-запити до двох endpoint'ів: /api/Room та /api/Sensor.
+
+from locust import HttpUser, task, between
+
+class ComfortSpaceUser(HttpUser):
+    wait_time = between(1, 2)
+
+    @task
+    def get_rooms(self):
+        with self.client.get(
+            "/api/Room",
+            catch_response=True
+        ) as response:
+            if response.status_code in [200, 401]:
+                response.success()
+
+    @task
+    def get_sensors(self):
+        with self.client.get(
+            "/api/Sensor",
+            catch_response=True
+        ) as response:
+            if response.status_code in [200, 401]:
+                response.success()
+
+
+Рисунок 4.1 – Результати тесту з 1 інстансом: RPS 65.8, Max 14276 мс
+При тестуванні з одним активним інстансом при навантаженні 100 користувачів зафіксовано середній показник 65.8 RPS. Критичним показником є максимальний час відповіді, який сягнув 14276 мс, що свідчить про суттєве перевантаження єдиного інстансу. Медіанний час відповіді залишився на рівні 6 мс, що вказує на високу нерівномірність — більшість запитів обробляється швидко, але пікові затримки критичні.
+
+
+Рисунок 4.2 – Результати тесту з 3 інстансами: RPS 66.7, Max 367 мс
+При активованих трьох інстансах система опрацювала 27548 запитів із середнім показником 66.7 RPS. Максимальний час відповіді знизився з 14276 мс до 367 мс — майже в 39 разів. 95-й перцентиль часу відповіді знизився з 8400 мс до 19 мс. Відсоток відмов залишився на рівні 0%.
+
+
+Рисунок 4.3 – Графіки RPS, Response Times та кількості користувачів
+На графіках відображено динаміку основних показників системи в реальному часі. Верхній графік (Total Requests per Second) демонструє стабілізацію RPS на рівні ~65-67. Графік Response Times показує стабільний час відгуку після початкового піку при нарощуванні навантаження. Нижній графік підтверджує поступове нарощування кількості користувачів до 100.
+
+
+Показник1 інстанс3 інстансиRPS (запитів/сек)65.866.7Median (мс)6695%ile (мс)840019Max (мс)14276367Failures0%0%Всього запитів161427548Таблиця 4.1 – Порівняльні результати навантажувального тестування
+
+4.6 Висновки
+У ході виконання лабораторної роботи було досліджено та практично реалізовано стратегію горизонтального масштабування бекенд-системи ComfortSpace на базі локальної контейнерної платформи Docker. На прикладі розгорнутого застосунку було продемонстровано перехід від одиничного інстансу до кластера з трьох вузлів, що працюють за спільним балансувальником навантаження Nginx.
+Проведений порівняльний аналіз навантажувальних тестів в інструменті Locust підтвердив ефективність обраного підходу: збільшення кількості інстансів з 1 до 3 дозволило критично стабілізувати часові показники — пікова затримка скоротилася майже в 39 разів: з 14276 мс до 367 мс, а 95-й перцентиль часу відповіді знизився з 8400 мс до 19 мс. Це доводить, що розподіл трафіку між декількома вузлами мінімізує вплив черг запитів на загальну продуктивність.
+Водночас тестування виявило архітектурні обмеження системи, де основним «вузьким місцем» став ліміт з'єднань із базою даних Microsoft SQL Server. Для подальшого зростання продуктивності горизонтальне розширення бекенда має супроводжуватися вертикальним масштабуванням бази даних або впровадженням механізмів кешування.
+
